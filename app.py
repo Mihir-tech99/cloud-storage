@@ -7,7 +7,7 @@ Features:
    - Real-time Connection Status Alert Banner
 2. Cryptographic SHA-256 Deduplication & Storage Health Analysis
 3. 7 Comprehensive Optimization Modules:
-   - 📊 Storage Analytics (Chart.js category breakdown & recommendations)
+   - 📊 Storage Analytics (Chart.js category doughnut + Live Category Distribution Bars)
    - 👯 SHA-256 Duplicate Detector (Grouping, original preservation, trash actions)
    - 🐘 Large File Audit (> 50 MB ranking)
    - 👻 Ghost & Clutter Detector (0-byte failed downloads, .tmp files)
@@ -72,16 +72,21 @@ def get_current_data():
     )
     cost = calculate_cost_savings(total_savings)
 
-    # Category aggregation for charts
+    # Category aggregation for charts and distribution bars
     cat_summary = []
     if not df.empty:
+        total_used_space = float(df["size"].sum()) if df["size"].sum() > 0 else 1.0
         for cat, group in df.groupby("category"):
+            cat_bytes = int(group["size"].sum())
+            pct = round((cat_bytes / total_used_space) * 100, 1)
             cat_summary.append({
-                "category": cat,
-                "bytes": int(group["size"].sum()),
-                "formatted": format_bytes(group["size"].sum()),
-                "count": len(group),
+                "category": str(cat),
+                "bytes": cat_bytes,
+                "formatted": format_bytes(cat_bytes),
+                "count": int(len(group)),
+                "percent": pct,
             })
+        cat_summary.sort(key=lambda x: x["bytes"], reverse=True)
 
     dupes_data = json.loads(dupes_df.to_json(orient="records")) if not dupes_df.empty else []
     large_data = json.loads(large_df.head(15).to_json(orient="records")) if not large_df.empty else []
@@ -118,12 +123,11 @@ HTML_TEMPLATE = """
     <title>Drive Optimizer - Cloud Storage Space Optimizer</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Chart.js UMD -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <!-- FontAwesome -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        /* Custom scrollbar for dark theme */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #0f172a; }
         ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
@@ -254,7 +258,7 @@ HTML_TEMPLATE = """
                     <h2 class="text-xl font-black text-white tracking-tight flex items-center gap-2">
                         <span>Cloud Storage Space Optimizer</span>
                         <span id="active-mode-badge" class="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-800">
-                            ✨ Simulated Cloud
+                            ✨ Simulated Cloud Active
                         </span>
                     </h2>
                     <p class="text-xs text-slate-400 mt-0.5">High-Precision Cryptographic SHA-256 Deduplication & Space Recovery Engine</p>
@@ -309,14 +313,29 @@ HTML_TEMPLATE = """
             <!-- MODULE 1: STORAGE ANALYTICS -->
             <div id="tab-analytics" class="tab-module">
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+                    <!-- Category Distribution Card -->
                     <div class="bg-[#151b28] p-6 rounded-2xl border border-slate-800 shadow-md">
-                        <h3 class="text-sm font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-2">
-                            <span>📊</span> Storage Distribution by File Category
-                        </h3>
-                        <div class="h-64 flex justify-center items-center">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                                <span>📊</span> Storage Distribution by File Category
+                            </h3>
+                            <span id="cat-total-badge" class="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-blue-950 text-blue-400 border border-blue-800">
+                                Loading categories...
+                            </span>
+                        </div>
+
+                        <!-- Chart Canvas Container -->
+                        <div class="relative w-full h-64 mb-6 flex items-center justify-center">
                             <canvas id="categoryChart"></canvas>
                         </div>
+
+                        <!-- Live Category Breakdown Bars & Statistics -->
+                        <div id="category-bars-list" class="space-y-3 pt-4 border-t border-slate-800/80">
+                            <!-- Populated dynamically with exact sizes, percentages, and progress bars -->
+                        </div>
                     </div>
+
+                    <!-- Instant Recommendations Card -->
                     <div class="bg-[#151b28] p-6 rounded-2xl border border-slate-800 shadow-md">
                         <h3 class="text-sm font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-2">
                             <span>⚡</span> Instant Optimization Recommendations
@@ -532,6 +551,16 @@ HTML_TEMPLATE = """
         let currentData = null;
         let chartInstance = null;
 
+        const CATEGORY_META = {
+            'Videos': { icon: '🎬', color: '#8b5cf6' },
+            'Photos & Images': { icon: '🖼️', color: '#ec4899' },
+            'Archives & Backups': { icon: '📦', color: '#f59e0b' },
+            'Documents': { icon: '📄', color: '#3b82f6' },
+            'Code & Binaries': { icon: '💻', color: '#10b981' },
+            'Audio': { icon: '🎵', color: '#06b6d4' },
+            'Other Files': { icon: '📁', color: '#64748b' }
+        };
+
         async function fetchStats() {
             try {
                 const res = await fetch('/api/stats');
@@ -540,6 +569,98 @@ HTML_TEMPLATE = """
             } catch (err) {
                 console.error('Error fetching stats:', err);
             }
+        }
+
+        function renderCategoryBars() {
+            const container = document.getElementById('category-bars-list');
+            if (!container || !currentData || !currentData.categories) return;
+
+            document.getElementById('cat-total-badge').innerText = `${currentData.categories.length} Categories · ${currentData.formatted_used}`;
+            container.innerHTML = '';
+
+            currentData.categories.forEach(c => {
+                const meta = CATEGORY_META[c.category] || { icon: '📁', color: '#3b82f6' };
+                const row = document.createElement('div');
+                row.className = 'group';
+                row.innerHTML = `
+                    <div class="flex justify-between items-center text-xs mb-1">
+                        <span class="font-semibold text-slate-200 flex items-center gap-1.5">
+                            <span class="w-2.5 h-2.5 rounded-full inline-block" style="background-color: ${meta.color}"></span>
+                            <span>${meta.icon} ${c.category}</span>
+                            <span class="text-slate-500 font-mono text-[10px]">(${c.count} file${c.count > 1 ? 's' : ''})</span>
+                        </span>
+                        <span class="font-mono text-xs font-bold text-slate-300">
+                            ${c.formatted} <span class="text-slate-500 font-normal">(${c.percent}%)</span>
+                        </span>
+                    </div>
+                    <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                        <div class="h-2 rounded-full transition-all duration-700" style="width: ${Math.max(c.percent, 1)}%; background-color: ${meta.color}"></div>
+                    </div>
+                `;
+                container.appendChild(row);
+            });
+        }
+
+        function renderChart() {
+            renderCategoryBars();
+
+            if (!currentData || !currentData.categories || currentData.categories.length === 0) return;
+            const canvas = document.getElementById('categoryChart');
+            if (!canvas) return;
+
+            if (typeof Chart === 'undefined') {
+                console.warn('Chart.js not yet loaded, retrying...');
+                setTimeout(renderChart, 300);
+                return;
+            }
+
+            const ctx = canvas.getContext('2d');
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+
+            const labels = currentData.categories.map(c => c.category);
+            const data = currentData.categories.map(c => c.bytes);
+            const colors = currentData.categories.map(c => (CATEGORY_META[c.category] || {}).color || '#3b82f6');
+
+            chartInstance = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors,
+                        borderWidth: 2,
+                        borderColor: '#151b28',
+                        hoverOffset: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: '#cbd5e1',
+                                boxWidth: 12,
+                                padding: 10,
+                                font: { size: 11, family: 'system-ui, sans-serif' }
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    const val = context.raw || 0;
+                                    const cat = currentData.categories[context.dataIndex];
+                                    return ` ${context.label}: ${formatBytes(val)} (${cat ? cat.percent : 0}%)`;
+                                }
+                            }
+                        }
+                    },
+                    cutout: '65%'
+                }
+            });
         }
 
         function renderUI() {
@@ -631,35 +752,6 @@ HTML_TEMPLATE = """
             renderChart();
         }
 
-        function renderChart() {
-            if (!currentData || !currentData.categories || currentData.categories.length === 0) return;
-            const ctx = document.getElementById('categoryChart').getContext('2d');
-            if (chartInstance) chartInstance.destroy();
-
-            const labels = currentData.categories.map(c => c.category);
-            const data = currentData.categories.map(c => c.bytes);
-
-            chartInstance = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        data: data,
-                        backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#64748b'],
-                        borderWidth: 2,
-                        borderColor: '#151b28'
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'right', labels: { color: '#94a3b8', font: { size: 11 } } }
-                    }
-                }
-            });
-        }
-
         function switchTab(tabId) {
             document.querySelectorAll('.tab-module').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.nav-item').forEach(el => {
@@ -669,6 +761,10 @@ HTML_TEMPLATE = """
             const activeBtn = document.getElementById('nav-btn-' + tabId);
             if (activeBtn) {
                 activeBtn.className = 'nav-item w-full text-left px-3 py-2 rounded-xl text-xs font-semibold text-white bg-blue-600 flex items-center gap-2.5 transition-all';
+            }
+
+            if (tabId === 'analytics') {
+                setTimeout(renderChart, 50);
             }
         }
 
