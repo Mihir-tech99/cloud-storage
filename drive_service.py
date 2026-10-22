@@ -10,15 +10,18 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 import hashlib
 import io
+import json
 import os
 import random
 import shutil
+import tempfile
 from typing import Any
 
 try:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.oauth2 import service_account
+    from google_auth_oauthlib.flow import InstalledAppFlow, Flow
     from googleapiclient.discovery import build
     GOOGLE_LIBS_AVAILABLE = True
 except ImportError:
@@ -31,55 +34,180 @@ SCOPES = [
 ]
 
 
+def resolve_storage_file(filename: str, check_writable: bool = False) -> str:
+    """Find a readable file path, or return a safe writable path in /tmp on serverless environments."""
+    if check_writable:
+        # Check if local directory is writable
+        try:
+            test_path = os.path.join(".", f".chk_{int(datetime.now().timestamp())}")
+            with open(test_path, "w") as f:
+                f.write("1")
+            os.remove(test_path)
+            return os.path.abspath(filename)
+        except Exception:
+            return os.path.join(tempfile.gettempdir(), filename)
+
+    # First check current directory
+    if os.path.exists(filename):
+        return os.path.abspath(filename)
+    # Then check /tmp
+    tmp_path = os.path.join(tempfile.gettempdir(), filename)
+    if os.path.exists(tmp_path):
+        return tmp_path
+    # Default to current directory if exists, else tmp
+    return tmp_path
+
+
 class LocalFolderManager:
     """
-    Scans a local synced cloud folder (e.g., Google Drive for Desktop, OneDrive, or any local directory).
+    Scans a local synced cloud folder (e.g. sample_files, Google Drive for Desktop, or any local directory).
     Computes real SHA-256 hashes without needing Google Cloud Console or credit cards.
     """
 
-    def __init__(self, root_dir: str):
-        self.root_dir = os.path.abspath(root_dir)
-        self.trash_dir = os.path.join(self.root_dir, ".optimizer_trash")
+    def __init__(self, root_dir: str = "sample_files"):
+        self.raw_path = root_dir
+        abs_path = os.path.abspath(root_dir)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        bundled_path = os.path.join(script_dir, root_dir)
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(root_dir))
+
+        if os.path.exists(abs_path):
+            self.root_dir = abs_path
+        elif os.path.exists(bundled_path):
+            self.root_dir = bundled_path
+        elif os.path.exists(tmp_path):
+            self.root_dir = tmp_path
+        else:
+            try:
+                os.makedirs(tmp_path, exist_ok=True)
+                self.root_dir = tmp_path
+            except Exception:
+                self.root_dir = abs_path
+
+        # If sample_files is empty or missing, populate with rich demo files
+        self._ensure_sample_files()
+
+        # Check if root_dir is writable for trash
+        is_writable = False
+        try:
+            if os.path.exists(self.root_dir) and os.access(self.root_dir, os.W_OK):
+                test_file = os.path.join(self.root_dir, f".wr_test_{int(datetime.now().timestamp())}")
+                with open(test_file, "w") as f:
+                    f.write("1")
+                os.remove(test_file)
+                is_writable = True
+        except Exception:
+            is_writable = False
+
+        if is_writable:
+            self.trash_dir = os.path.join(self.root_dir, ".optimizer_trash")
+        else:
+            self.trash_dir = os.path.join(tempfile.gettempdir(), ".optimizer_trash")
+
         self.user_info = {
             "displayName": "Local Synced Cloud User",
             "emailAddress": "local.drive@pc.sync",
         }
+        self._hash_cache: dict[str, tuple[float, int, str]] = {}
 
-    def get_quota(self) -> dict[str, Any]:
-        """Calculates storage usage and drive capacity."""
+    def _ensure_sample_files(self):
+        """Ensure sample_files contains files for scanning if target is sample_files."""
+        # Only populate if this is specifically the sample_files folder
+        if "sample_files" not in os.path.basename(self.root_dir).lower() and "sample_files" not in self.raw_path.lower():
+            return
+
         if not os.path.exists(self.root_dir):
-            return {"limit": 15 * 1024**3, "usage": 0, "usageInDrive": 0, "usageInDriveTrash": 0}
+            try:
+                os.makedirs(self.root_dir, exist_ok=True)
+            except Exception:
+                return
 
         try:
-            total, used, free = shutil.disk_usage(self.root_dir)
-            files = self.list_files()
-            folder_usage = sum(f["size"] for f in files)
-            trash_usage = 0
-            if os.path.exists(self.trash_dir):
-                for root, _, filenames in os.walk(self.trash_dir):
-                    for fn in filenames:
-                        trash_usage += os.path.getsize(os.path.join(root, fn))
+            existing = [f for f in os.listdir(self.root_dir) if not f.startswith(".")]
+            if len(existing) > 0:
+                return
+        except Exception:
+            pass
 
-            # Virtual 15 GB quota cap for realistic display, or actual disk usage
-            limit = 15 * 1024 * 1024 * 1024
-            return {
-                "limit": limit,
-                "usage": folder_usage + trash_usage,
-                "usageInDrive": folder_usage,
-                "usageInDriveTrash": trash_usage,
-            }
+        try:
+            doc_content = b"Cloud Computing Storage Optimizer Demonstration Notes.\nLecture 4: Cloud Resource Optimization and Storage Deduplication.\n"
+            with open(os.path.join(self.root_dir, "Cloud_Notes_Lecture.txt"), "wb") as f:
+                f.write(doc_content)
+            with open(os.path.join(self.root_dir, "Cloud_Notes_Lecture_DUPLICATE.txt"), "wb") as f:
+                f.write(doc_content)
+
+            pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Title (Quarterly Cloud Financial Report) >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n" + (b"DATA_PADDING_" * 500)
+            with open(os.path.join(self.root_dir, "Quarterly_Financial_Report.pdf"), "wb") as f:
+                f.write(pdf_content)
+            with open(os.path.join(self.root_dir, "Quarterly_Financial_Report_COPY.pdf"), "wb") as f:
+                f.write(pdf_content)
+
+            img_content = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x01\x00\x08\x06\x00\x00\x00" + (b"\xaa\xbb\xcc\xdd" * 400)
+            with open(os.path.join(self.root_dir, "System_Architecture_Diagram.png"), "wb") as f:
+                f.write(img_content)
+            with open(os.path.join(self.root_dir, "System_Architecture_Backup.png"), "wb") as f:
+                f.write(img_content)
+
+            csv_content = b"id,customer_name,storage_gb,plan\n1,Alice,250,Enterprise\n2,Bob,50,Basic\n3,Charlie,500,Pro\n" + (b"row_data_entry_metric_stream\n" * 50)
+            with open(os.path.join(self.root_dir, "Customer_Dataset_2026.csv"), "wb") as f:
+                f.write(csv_content)
+            with open(os.path.join(self.root_dir, "Customer_Dataset_2026_DUPLICATE.csv"), "wb") as f:
+                f.write(csv_content)
+
+            with open(os.path.join(self.root_dir, "interrupted_download.tmp"), "wb") as f:
+                f.write(b"Temporary residual cache file")
+
+            with open(os.path.join(self.root_dir, "application_debug.log"), "wb") as f:
+                f.write(b"[DEBUG] 2026-10-22 Cache sync initialized\n[TRACE] Stale buffer dumped\n")
+
+            with open(os.path.join(self.root_dir, "0_byte_ghost_file.txt"), "wb") as f:
+                f.write(b"")
+
+            with open(os.path.join(self.root_dir, "junk_test_file.txt"), "wb") as f:
+                f.write(("Cloud Space Optimizer Test Junk File: Temporary data clutter.\n" * 5).encode("utf-8")[:209])
         except Exception as e:
-            print(f"Error getting disk quota: {e}")
-            return {"limit": 15 * 1024**3, "usage": 0, "usageInDrive": 0, "usageInDriveTrash": 0}
+            print(f"Notice: Could not write sample files into {self.root_dir}: {e}")
+
+    def get_quota(self, files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Calculates storage usage and drive capacity with fast 0ms computation."""
+        limit = 15 * 1024 * 1024 * 1024  # 15 GB Virtual Quota
+        folder_usage = 0
+        trash_usage = 0
+
+        if files is not None:
+            folder_usage = sum(f.get("size", 0) for f in files)
+        elif os.path.exists(self.root_dir):
+            for root, _, filenames in os.walk(self.root_dir):
+                if ".optimizer_trash" in root:
+                    continue
+                for fn in filenames:
+                    try:
+                        folder_usage += os.path.getsize(os.path.join(root, fn))
+                    except Exception:
+                        pass
+
+        if os.path.exists(self.trash_dir):
+            for root, _, filenames in os.walk(self.trash_dir):
+                for fn in filenames:
+                    try:
+                        trash_usage += os.path.getsize(os.path.join(root, fn))
+                    except Exception:
+                        pass
+
+        return {
+            "limit": limit,
+            "usage": folder_usage + trash_usage,
+            "usageInDrive": folder_usage,
+            "usageInDriveTrash": trash_usage,
+        }
 
     def list_files(self, max_files: int = 1000) -> list[dict[str, Any]]:
-        """Walks the folder and calculates SHA-256 hashes for all files."""
+        """Walks the folder and calculates SHA-256 hashes for all files with hash caching."""
         if not os.path.exists(self.root_dir):
             return []
 
         results = []
         for root, dirs, filenames in os.walk(self.root_dir):
-            # Skip hidden trash folder
             if ".optimizer_trash" in root:
                 continue
 
@@ -90,15 +218,20 @@ class LocalFolderManager:
                 try:
                     stat = os.stat(fpath)
                     fsize = stat.st_size
+                    mtime_ts = stat.st_mtime
 
-                    # Compute SHA-256 hash
-                    hasher = hashlib.sha256()
-                    with open(fpath, "rb") as f:
-                        while chunk := f.read(65536):
-                            hasher.update(chunk)
-                    sha = hasher.hexdigest()
+                    cached_entry = self._hash_cache.get(fpath)
+                    if cached_entry and cached_entry[0] == mtime_ts and cached_entry[1] == fsize:
+                        sha = cached_entry[2]
+                    else:
+                        hasher = hashlib.sha256()
+                        with open(fpath, "rb") as f:
+                            while chunk := f.read(65536):
+                                hasher.update(chunk)
+                        sha = hasher.hexdigest()
+                        self._hash_cache[fpath] = (mtime_ts, fsize, sha)
 
-                    mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+                    mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat()
                     ctime = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
 
                     ext = os.path.splitext(fname)[1].lower()
@@ -106,12 +239,12 @@ class LocalFolderManager:
                     if ext in [".mp4", ".mkv", ".mov"]:
                         mime = "video/mp4"
                     elif ext in [".jpg", ".jpeg", ".png"]:
-                        mime = "image/jpeg"
+                        mime = "image/png"
                     elif ext in [".pdf"]:
                         mime = "application/pdf"
                     elif ext in [".csv"]:
                         mime = "text/csv"
-                    elif ext in [".txt"]:
+                    elif ext in [".txt", ".log"]:
                         mime = "text/plain"
                     elif ext in [".zip", ".gz", ".tar"]:
                         mime = "application/zip"
@@ -133,7 +266,7 @@ class LocalFolderManager:
         return results
 
     def move_to_trash(self, file_id: str) -> tuple[bool, str]:
-        """Safely moves file to .optimizer_trash folder."""
+        """Safely moves file to trash folder."""
         fpath = file_id
         if not os.path.exists(fpath):
             return False, "File does not exist."
@@ -141,7 +274,6 @@ class LocalFolderManager:
         try:
             os.makedirs(self.trash_dir, exist_ok=True)
             dest = os.path.join(self.trash_dir, os.path.basename(fpath))
-            # Handle collision
             if os.path.exists(dest):
                 base, ext = os.path.splitext(os.path.basename(fpath))
                 dest = os.path.join(self.trash_dir, f"{base}_{int(datetime.now().timestamp())}{ext}")
@@ -160,47 +292,217 @@ class LocalFolderManager:
                 return False, str(e)
         return True, "Trash is already empty."
 
+    def add_test_junk_file(self, name: str = "junk_test_file.txt", size: int = 209) -> dict[str, Any]:
+        """Creates a real test junk file in the local folder for scanner testing."""
+        target_dir = self.root_dir
+        if not os.access(target_dir, os.W_OK):
+            target_dir = tempfile.gettempdir()
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            fpath = os.path.join(target_dir, name)
+            content = "Cloud Space Optimizer Test Junk File: Temporary data clutter.\n" * 5
+            content_bytes = content.encode("utf-8")[:size]
+            with open(fpath, "wb") as f:
+                f.write(content_bytes)
+            return {"id": fpath, "name": name, "size": len(content_bytes)}
+        except Exception as e:
+            return {"id": name, "name": name, "size": size}
+
 
 class GoogleDriveManager:
     """Manages live Google Drive API connections, metadata extraction, and file management."""
 
-    def __init__(self, credentials_path: str = "credentials.json", token_path: str = "token.json"):
-        self.credentials_path = credentials_path
-        self.token_path = token_path
+    def __init__(self, credentials_path: str | None = None, token_path: str | None = None):
+        self.credentials_path = credentials_path or resolve_storage_file("credentials.json")
+        self.token_path = token_path or resolve_storage_file("token.json", check_writable=True)
         self.service = None
         self.user_info = {}
+        self._try_load_existing_token()
+
+    def _try_load_existing_token(self):
+        """Attempts to load credentials from token_path or environment/tmp."""
+        if not GOOGLE_LIBS_AVAILABLE:
+            return
+
+        for token_file in [self.token_path, resolve_storage_file("token.json"), os.path.join(tempfile.gettempdir(), "token.json")]:
+            if token_file and os.path.exists(token_file):
+                try:
+                    creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+                    if creds and creds.expired and creds.refresh_token:
+                        creds.refresh(Request())
+                        try:
+                            with open(self.token_path, "w", encoding="utf-8") as f:
+                                f.write(creds.to_json())
+                        except Exception:
+                            pass
+
+                    if creds and creds.valid:
+                        self.service = build("drive", "v3", credentials=creds)
+                        about = self.service.about().get(fields="user,storageQuota").execute()
+                        self.user_info = about.get("user", {})
+                        return
+                except Exception as e:
+                    print(f"Notice: Could not load token from {token_file}: {e}")
+
+    def authenticate_with_token(self, token_str: str) -> tuple[bool, str]:
+        """Authenticate directly using an access token or bearer token."""
+        if not GOOGLE_LIBS_AVAILABLE:
+            return False, "Google client libraries are missing. Please install requirements.txt."
+        token_str = token_str.strip()
+        if not token_str:
+            return False, "Access token is empty."
+        try:
+            creds = Credentials(token=token_str)
+            self.service = build("drive", "v3", credentials=creds)
+            about = self.service.about().get(fields="user,storageQuota").execute()
+            self.user_info = about.get("user", {})
+            try:
+                with open(self.token_path, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+            except Exception:
+                pass
+            name = self.user_info.get("displayName", "User")
+            email = self.user_info.get("emailAddress", "")
+            return True, f"Connected to Google Drive as {name} ({email})!"
+        except Exception as e:
+            self.service = None
+            return False, f"Google Drive connection failed: {str(e)}"
+
+    def authenticate_with_service_account(self, creds_path: str) -> tuple[bool, str]:
+        """Authenticate using a Google Cloud Service Account JSON."""
+        if not GOOGLE_LIBS_AVAILABLE:
+            return False, "Google client libraries are missing."
+        try:
+            creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+            self.service = build("drive", "v3", credentials=creds)
+            about = self.service.about().get(fields="user,storageQuota").execute()
+            self.user_info = about.get("user", {})
+            return True, f"Connected to Google Drive via Service Account ({self.user_info.get('emailAddress', 'Service Account')})"
+        except Exception as e:
+            return False, f"Service account authentication error: {str(e)}"
+
+    def get_authorization_url(self, redirect_uri: str) -> tuple[str, str]:
+        """Generates Google OAuth 2.0 authorization URL."""
+        if not GOOGLE_LIBS_AVAILABLE:
+            raise RuntimeError("Google client libraries not installed.")
+        cred_file = resolve_storage_file("credentials.json")
+        if not cred_file or not os.path.exists(cred_file):
+            raise FileNotFoundError("Credentials file 'credentials.json' not found. Please upload it first.")
+
+        flow = Flow.from_client_secrets_file(
+            cred_file,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri
+        )
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent"
+        )
+        return auth_url, state
+
+    def exchange_code(self, code: str, redirect_uri: str) -> tuple[bool, str]:
+        """Exchange authorization code for credentials/tokens."""
+        if not GOOGLE_LIBS_AVAILABLE:
+            return False, "Google client libraries missing."
+        cred_file = resolve_storage_file("credentials.json")
+        if not cred_file or not os.path.exists(cred_file):
+            return False, "Credentials file 'credentials.json' not found."
+        try:
+            flow = Flow.from_client_secrets_file(
+                cred_file,
+                scopes=SCOPES,
+                redirect_uri=redirect_uri
+            )
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            try:
+                with open(self.token_path, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+            except Exception:
+                pass
+            self.service = build("drive", "v3", credentials=creds)
+            about = self.service.about().get(fields="user,storageQuota").execute()
+            self.user_info = about.get("user", {})
+            name = self.user_info.get("displayName", "User")
+            email = self.user_info.get("emailAddress", "")
+            return True, f"Successfully connected to Google Drive as {name} ({email})!"
+        except Exception as e:
+            return False, f"OAuth Token Exchange Error: {str(e)}"
 
     def authenticate(self) -> tuple[bool, str]:
-        """Authenticate with Google Drive via OAuth 2.0."""
+        """Authenticate with Google Drive via OAuth 2.0, service account, or existing token."""
         if not GOOGLE_LIBS_AVAILABLE:
             return False, "Google client libraries are missing. Please install requirements.txt."
 
-        if not os.path.exists(self.credentials_path):
-            return False, f"Credentials file '{self.credentials_path}' not found. Upload it in the sidebar."
+        if self.service:
+            name = self.user_info.get("displayName", "User")
+            email = self.user_info.get("emailAddress", "")
+            return True, f"Connected to Google Drive as {name} ({email})"
 
-        creds = None
+        cred_file = resolve_storage_file("credentials.json")
+        if not cred_file or not os.path.exists(cred_file):
+            return False, "Credentials file 'credentials.json' not found. Upload it or use the Instant Token Connect option."
+
         try:
-            if os.path.exists(self.token_path):
-                creds = Credentials.from_authorized_user_file(self.token_path, SCOPES)
+            with open(cred_file, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if raw.get("type") == "service_account":
+                return self.authenticate_with_service_account(cred_file)
+        except Exception:
+            pass
 
-            if not creds or not creds.valid:
+        token_file = resolve_storage_file("token.json")
+        if token_file and os.path.exists(token_file):
+            try:
+                creds = Credentials.from_authorized_user_file(token_file, SCOPES)
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
-                else:
-                    flow = InstalledAppFlow.from_client_secrets_file(self.credentials_path, SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    try:
+                        with open(self.token_path, "w", encoding="utf-8") as f:
+                            f.write(creds.to_json())
+                    except Exception:
+                        pass
+                if creds and creds.valid:
+                    self.service = build("drive", "v3", credentials=creds)
+                    about = self.service.about().get(fields="user,storageQuota").execute()
+                    self.user_info = about.get("user", {})
+                    return True, f"Connected to Google Drive as {self.user_info.get('displayName', 'User')} ({self.user_info.get('emailAddress', '')})"
+            except Exception as e:
+                print(f"Token refresh error: {e}")
 
-                with open(self.token_path, "w", encoding="utf-8") as token_file:
-                    token_file.write(creds.to_json())
+        # Check client type from credentials.json
+        is_web_client = False
+        try:
+            with open(cred_file, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+            if "web" in c_data:
+                is_web_client = True
+        except Exception:
+            pass
 
+        # If it is a Web Client, or if on Vercel/cloud serverless, trigger web OAuth flow
+        if is_web_client or os.environ.get("VERCEL") == "1" or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+            return False, "OAUTH_FLOW_REQUIRED"
+
+        # On local desktop with installed/desktop credentials, attempt local server
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(cred_file, SCOPES)
+            creds = flow.run_local_server(port=0)
+            try:
+                with open(self.token_path, "w", encoding="utf-8") as token_file_out:
+                    token_file_out.write(creds.to_json())
+            except Exception:
+                pass
             self.service = build("drive", "v3", credentials=creds)
             about = self.service.about().get(fields="user,storageQuota").execute()
             self.user_info = about.get("user", {})
             return True, f"Connected to Google Drive as {self.user_info.get('displayName', 'User')} ({self.user_info.get('emailAddress', '')})"
         except Exception as e:
-            return False, f"Authentication error: {str(e)}"
+            # Fall back to web OAuth flow
+            return False, "OAUTH_FLOW_REQUIRED"
 
-    def get_quota(self) -> dict[str, Any]:
+    def get_quota(self, files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Fetch storage quota from Google Drive."""
         if not self.service:
             return {"limit": 0, "usage": 0, "usageInDrive": 0, "usageInDriveTrash": 0}
@@ -289,10 +591,10 @@ class MockDriveManager:
         self.trash_size_bytes = 750 * 1024 * 1024  # 750 MB in trash
         self.files = self._generate_mock_dataset()
 
-    def get_quota(self) -> dict[str, Any]:
+    def get_quota(self, files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Simulated 15 GB Google Drive quota."""
         limit = 15 * 1024 * 1024 * 1024  # 15 GB
-        files_size = sum(f["size"] for f in self.files)
+        files_size = sum(f["size"] for f in (files if files is not None else self.files))
         usage = files_size + self.trash_size_bytes
         return {
             "limit": limit,
@@ -319,6 +621,31 @@ class MockDriveManager:
         self.trash_size_bytes = 0
         self.files = [f for f in self.files if not f.get("trashed", False)]
         return True, f"Emptied {freed / (1024**2):.1f} MB from trash."
+
+    def add_test_junk_file(self, name: str = "junk_test_file.txt", size: int = 209) -> dict[str, Any]:
+        """Add a specific test junk file so the user can test junk detection and 1-click removal."""
+        now = datetime.now(timezone.utc)
+        # Check if already present and not trashed
+        for f in self.files:
+            if f["name"] == name:
+                f["trashed"] = False
+                return f
+
+        file_id = f"cloud_file_junk_{int(now.timestamp())}"
+        sha = "7a2cc089e15f0360ac1204c37f488453df952b92b04f5f6b6fdd6e499bfe735a"
+        new_file = {
+            "id": file_id,
+            "name": name,
+            "mimeType": "text/plain",
+            "size": size,
+            "sha256": sha,
+            "createdTime": now.isoformat(),
+            "modifiedTime": now.isoformat(),
+            "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
+            "trashed": False,
+        }
+        self.files.insert(0, new_file)
+        return new_file
 
     def _generate_mock_dataset(self) -> list[dict[str, Any]]:
         """Build realistic files with authentic SHA-256 hashes."""
@@ -476,8 +803,9 @@ class MockDriveManager:
             })
             file_id_counter += 1
 
-        # Clutter, temporary, and 0-byte ghost files
+        # Clutter, temporary, explicit junk, and 0-byte ghost files
         clutter_files = [
+            ("junk_test_file.txt", "text/plain", 209, 1),
             ("interrupted_download_dataset.crdownload", "application/octet-stream", 0, 12),
             ("~lock.Semester_Project_Presentation.pptx#", "application/octet-stream", 0, 4),
             ("cache_metadata_chunk_001.tmp", "application/octet-stream", 15 * 1024 * 1024, 8),
@@ -488,7 +816,12 @@ class MockDriveManager:
         ]
         for name, mime, size, days in clutter_files:
             dt = now - timedelta(days=days)
-            file_sha = hashlib.sha256(f"{name}_{size}".encode()).hexdigest() if size > 0 else ""
+            if name == "junk_test_file.txt":
+                file_sha = "7a2cc089e15f0360ac1204c37f488453df952b92b04f5f6b6fdd6e499bfe735a"
+            elif size > 0:
+                file_sha = hashlib.sha256(f"{name}_{size}".encode()).hexdigest()
+            else:
+                file_sha = ""
             files.append({
                 "id": f"cloud_file_{file_id_counter}",
                 "name": name,

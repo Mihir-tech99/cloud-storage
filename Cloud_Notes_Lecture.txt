@@ -1,0 +1,2 @@
+Cloud Computing Storage Optimizer Demonstration Notes.
+Lecture 4: Cloud Resource Optimization and Storage Deduplication.

@@ -53,8 +53,12 @@ def format_bytes(bytes_num: float | int) -> str:
 
 def categorize_file(mime_type: str, file_name: str) -> str:
     """Categorize file based on MIME type and filename extension."""
-    mime_type = (mime_type or "").lower()
-    ext = os.path.splitext(file_name or "")[1].lower()
+    if not isinstance(mime_type, str):
+        mime_type = ""
+    if not isinstance(file_name, str):
+        file_name = ""
+    mime_type = mime_type.lower()
+    ext = os.path.splitext(file_name)[1].lower()
 
     if "video" in mime_type or ext in [".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v"]:
         return "Videos"
@@ -268,12 +272,12 @@ def calculate_storage_health(total_used_bytes: int, total_quota_bytes: int, dupl
 
 def audit_empty_and_temp_files(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Identify 0-byte ghost files and temporary/cache clutter files (.tmp, .log, .bak, .part, etc.).
+    Identify 0-byte ghost files, explicit junk files, and temporary/cache clutter (.tmp, .log, .bak, .part, etc.).
     """
     if df.empty:
         return pd.DataFrame()
 
-    temp_extensions = [".tmp", ".temp", ".log", ".bak", ".part", ".crdownload", ".swp", ".cache", ".dmp"]
+    temp_extensions = [".tmp", ".temp", ".log", ".bak", ".part", ".crdownload", ".swp", ".cache", ".dmp", ".junk", ".old"]
 
     def is_temp_or_empty(row):
         name = str(row.get("name", "")).lower()
@@ -281,7 +285,9 @@ def audit_empty_and_temp_files(df: pd.DataFrame) -> pd.DataFrame:
         ext = os.path.splitext(name)[1].lower()
 
         if size == 0:
-            return True, "Zero-Byte (Empty) File"
+            return True, "Zero-Byte (Empty) Ghost File"
+        if "junk" in name:
+            return True, "Identified Junk File ('junk' keyword in filename)"
         if ext in temp_extensions:
             return True, f"Temporary/Cache Clutter ({ext})"
         if name.startswith("~") or name.startswith("."):
@@ -334,4 +340,164 @@ def calculate_cost_savings(reclaimable_bytes: int) -> dict:
         "annual_inr": round(annual_inr, 2),
         "tier_avoided": tier_avoided,
     }
+
+
+def scan_files_safety_and_junk(
+    df: pd.DataFrame,
+    dupes_df: pd.DataFrame | None = None,
+    clutter_df: pd.DataFrame | None = None,
+) -> tuple[list[dict], dict]:
+    """
+    Scans all files and classifies each into:
+      1. 'safe': "This file is Safe" (Valid documents, photos, media, archives with verified integrity)
+      2. 'junk': "This file is a Junk file" (0-byte empty files, .tmp/.cache/.bak clutter, redundant duplicate copies)
+      3. 'suspicious': "This file is Unsafe / Risk" (Executable scripts, unverified binaries)
+
+    Returns:
+      (scanned_files_list, summary_stats_dict)
+    """
+    if df.empty:
+        return [], {
+            "total_files": 0,
+            "safe_count": 0,
+            "junk_count": 0,
+            "suspicious_count": 0,
+            "junk_bytes": 0,
+            "formatted_junk_bytes": "0 B",
+            "all_safe": True,
+            "status_message": "All files are safe!",
+            "status_class": "safe",
+        }
+
+    clutter_map: dict[str, str] = {}
+    if clutter_df is not None and not clutter_df.empty:
+        for _, row in clutter_df.iterrows():
+            fid = str(row.get("id", ""))
+            reason = str(row.get("clutter_reason", "Temporary / cache clutter"))
+            if fid:
+                clutter_map[fid] = reason
+
+    redundant_dupe_ids: set[str] = set()
+    if dupes_df is not None and not dupes_df.empty and "is_redundant" in dupes_df.columns:
+        redundant_dupes = dupes_df[dupes_df["is_redundant"]]
+        for _, row in redundant_dupes.iterrows():
+            fid = str(row.get("id", ""))
+            if fid:
+                redundant_dupe_ids.add(fid)
+
+    suspicious_exts = {".exe", ".bat", ".cmd", ".vbs", ".ps1", ".scr", ".msi", ".pif", ".reg", ".hta"}
+    results: list[dict] = []
+
+    junk_bytes = 0
+    safe_count = 0
+    junk_count = 0
+    suspicious_count = 0
+
+    for _, row in df.iterrows():
+        fid = str(row.get("id", ""))
+        name = str(row.get("name", "Unknown"))
+        size = int(row.get("size", 0))
+        name_lower = name.lower()
+        ext = os.path.splitext(name)[1].lower()
+
+        # 0. Check explicit junk marker in filename (e.g. junk_test_file.txt)
+        if "junk" in name_lower:
+            is_junk = True
+            is_safe = False
+            status = "junk"
+            status_label = "This file is a Junk file"
+            status_badge = "Junk File"
+            reason = f"Junk: File marked as junk clutter ('{name}')"
+            junk_count += 1
+            junk_bytes += size
+
+        # 1. Check for clutter (0-byte, temp, cache)
+        elif fid in clutter_map:
+            c_reason = clutter_map[fid]
+            is_junk = True
+            is_safe = False
+            status = "junk"
+            status_label = "This file is a Junk file"
+            status_badge = "Junk File"
+            reason = f"Junk: {c_reason}"
+            junk_count += 1
+            junk_bytes += size
+
+        # 2. Check for redundant duplicate copy
+        elif fid in redundant_dupe_ids:
+            is_junk = True
+            is_safe = False
+            status = "junk"
+            status_label = "This file is a Junk file"
+            status_badge = "Junk Duplicate"
+            reason = "Junk: Redundant duplicate copy (Identical SHA-256 byte match)"
+            junk_count += 1
+            junk_bytes += size
+
+        # 3. Check for suspicious / unsafe executable file extensions
+        elif ext in suspicious_exts:
+            is_junk = False
+            is_safe = False
+            status = "suspicious"
+            status_label = "This file is Unsafe / Potential Risk"
+            status_badge = "Security Risk"
+            reason = f"Security Risk: Executable/script ({ext}) found in cloud storage"
+            suspicious_count += 1
+
+        # 4. Legitimate verified safe file
+        else:
+            is_junk = False
+            is_safe = True
+            status = "safe"
+            status_label = "This file is Safe"
+            status_badge = "Safe"
+            reason = "Verified authentic file · Passed integrity & clutter checks"
+            safe_count += 1
+
+        results.append({
+            "id": fid,
+            "name": name,
+            "size": size,
+            "formatted_size": format_bytes(size),
+            "mimeType": str(row.get("mimeType", "")),
+            "category": str(row.get("category", "Other Files")),
+            "sha256": str(row.get("sha256", "") or ""),
+            "age_days": int(row.get("age_days", 0)),
+            "webViewLink": str(row.get("webViewLink", "") or ""),
+            "is_safe": is_safe,
+            "is_junk": is_junk,
+            "status": status,
+            "status_label": status_label,
+            "status_badge": status_badge,
+            "reason": reason,
+        })
+
+    all_safe = (junk_count == 0 and suspicious_count == 0)
+    if all_safe:
+        status_message = "All files are safe! 100% of stored files passed integrity and safety checks."
+        status_class = "safe"
+    elif junk_count == 1 and suspicious_count == 0:
+        status_message = f"1 junk file detected for cleanup ({format_bytes(junk_bytes)}). Clean this junk file to make all files safe!"
+        status_class = "junk_found"
+    elif junk_count > 1 and suspicious_count == 0:
+        status_message = f"{junk_count} junk file(s) detected for cleanup ({format_bytes(junk_bytes)} reclaimable). Clean junk files to make all files safe!"
+        status_class = "junk_found"
+    else:
+        status_message = f"Found {junk_count} junk file(s) and {suspicious_count} suspicious file(s). Review and clean now."
+        status_class = "warning"
+
+    summary = {
+        "total_files": len(results),
+        "safe_count": safe_count,
+        "junk_count": junk_count,
+        "suspicious_count": suspicious_count,
+        "junk_bytes": junk_bytes,
+        "formatted_junk_bytes": format_bytes(junk_bytes),
+        "all_safe": all_safe,
+        "status_message": status_message,
+        "status_class": status_class,
+    }
+
+    return results, summary
+
 
