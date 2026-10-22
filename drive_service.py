@@ -309,6 +309,23 @@ class LocalFolderManager:
             return {"id": name, "name": name, "size": size}
 
 
+def normalize_client_config(raw_dict: dict[str, Any]) -> dict[str, Any]:
+    """Ensure client secrets dict contains all required fields for google_auth_oauthlib."""
+    if not isinstance(raw_dict, dict):
+        raise ValueError("Invalid client secrets format.")
+    key = "web" if "web" in raw_dict else ("installed" if "installed" in raw_dict else None)
+    if not key:
+        raise ValueError("credentials.json must contain either 'web' or 'installed' configuration.")
+    c = dict(raw_dict.get(key, {}))
+    if not c.get("auth_uri"):
+        c["auth_uri"] = "https://accounts.google.com/o/oauth2/auth"
+    if not c.get("token_uri"):
+        c["token_uri"] = "https://oauth2.googleapis.com/token"
+    if not c.get("client_id") or not c.get("client_secret"):
+        raise ValueError("The credentials file is missing 'client_id' or 'client_secret'.")
+    return {key: c}
+
+
 class GoogleDriveManager:
     """Manages live Google Drive API connections, metadata extraction, and file management."""
 
@@ -366,7 +383,10 @@ class GoogleDriveManager:
             return True, f"Connected to Google Drive as {name} ({email})!"
         except Exception as e:
             self.service = None
-            return False, f"Google Drive connection failed: {str(e)}"
+            err_msg = str(e)
+            if "refresh" in err_msg.lower() or "401" in err_msg or "invalid_token" in err_msg.lower() or "invalid_grant" in err_msg.lower():
+                return False, "Invalid or expired Access Token. Please generate a fresh token from Google OAuth Playground (Step 2) and try again."
+            return False, f"Google Drive connection failed: {err_msg}"
 
     def authenticate_with_service_account(self, creds_path: str) -> tuple[bool, str]:
         """Authenticate using a Google Cloud Service Account JSON."""
@@ -381,36 +401,94 @@ class GoogleDriveManager:
         except Exception as e:
             return False, f"Service account authentication error: {str(e)}"
 
-    def get_authorization_url(self, redirect_uri: str) -> tuple[str, str]:
-        """Generates Google OAuth 2.0 authorization URL."""
+    def get_authorization_url(self, redirect_uri: str, client_config: dict[str, Any] | None = None) -> tuple[str, str]:
+        """Generates Google OAuth 2.0 authorization URL from config dict or credentials.json."""
         if not GOOGLE_LIBS_AVAILABLE:
             raise RuntimeError("Google client libraries not installed.")
-        cred_file = resolve_storage_file("credentials.json")
-        if not cred_file or not os.path.exists(cred_file):
-            raise FileNotFoundError("Credentials file 'credentials.json' not found. Please upload it first.")
 
-        flow = Flow.from_client_secrets_file(
-            cred_file,
+        cfg = None
+        if client_config:
+            cfg = normalize_client_config(client_config)
+        else:
+            cred_file = resolve_storage_file("credentials.json")
+            if cred_file and os.path.exists(cred_file):
+                try:
+                    with open(cred_file, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    cfg = normalize_client_config(raw)
+                except Exception as e:
+                    raise ValueError(f"Invalid credentials file: {e}")
+            else:
+                raise FileNotFoundError("Credentials not configured. Please upload credentials.json or use Quick Token Connect.")
+
+        # Encode cid and cs into state to make flow 100% stateless across serverless containers
+        custom_state = None
+        c_info = cfg.get("web") or cfg.get("installed", {})
+        if c_info.get("client_id") and c_info.get("client_secret"):
+            try:
+                import base64
+                s_payload = json.dumps({"cid": c_info["client_id"], "cs": c_info["client_secret"]})
+                custom_state = base64.urlsafe_b64encode(s_payload.encode()).decode()
+            except Exception:
+                pass
+
+        flow = Flow.from_client_config(
+            cfg,
             scopes=SCOPES,
             redirect_uri=redirect_uri
         )
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent"
-        )
+        auth_kwargs = {
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "prompt": "consent",
+        }
+        if custom_state:
+            auth_kwargs["state"] = custom_state
+
+        auth_url, state = flow.authorization_url(**auth_kwargs)
         return auth_url, state
 
-    def exchange_code(self, code: str, redirect_uri: str) -> tuple[bool, str]:
+    def exchange_code(self, code: str, redirect_uri: str, client_config: dict[str, Any] | None = None, state: str | None = None) -> tuple[bool, str]:
         """Exchange authorization code for credentials/tokens."""
         if not GOOGLE_LIBS_AVAILABLE:
             return False, "Google client libraries missing."
-        cred_file = resolve_storage_file("credentials.json")
-        if not cred_file or not os.path.exists(cred_file):
-            return False, "Credentials file 'credentials.json' not found."
+
+        cfg = None
+        if client_config:
+            try:
+                cfg = normalize_client_config(client_config)
+            except Exception as e:
+                return False, f"Invalid client config: {e}"
+
+        if not cfg and state:
+            try:
+                import base64
+                s_payload = json.loads(base64.urlsafe_b64decode(state.encode()).decode())
+                if s_payload.get("cid") and s_payload.get("cs"):
+                    cfg = normalize_client_config({
+                        "web": {
+                            "client_id": s_payload["cid"],
+                            "client_secret": s_payload["cs"],
+                        }
+                    })
+            except Exception as e:
+                print(f"Notice: Could not extract client credentials from OAuth state: {e}")
+
+        if not cfg:
+            cred_file = resolve_storage_file("credentials.json")
+            if cred_file and os.path.exists(cred_file):
+                try:
+                    with open(cred_file, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    cfg = normalize_client_config(raw)
+                except Exception as e:
+                    return False, f"Invalid credentials file: {e}"
+            else:
+                return False, "Credentials configuration not found."
+
         try:
-            flow = Flow.from_client_secrets_file(
-                cred_file,
+            flow = Flow.from_client_config(
+                cfg,
                 scopes=SCOPES,
                 redirect_uri=redirect_uri
             )

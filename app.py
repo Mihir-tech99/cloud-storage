@@ -26,9 +26,9 @@ import os
 import time
 import tempfile
 import shutil
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
 
-from drive_service import MockDriveManager, LocalFolderManager, GoogleDriveManager, GOOGLE_LIBS_AVAILABLE, resolve_storage_file
+from drive_service import MockDriveManager, LocalFolderManager, GoogleDriveManager, GOOGLE_LIBS_AVAILABLE, resolve_storage_file, normalize_client_config
 from optimizer import (
     compute_sha256,
     format_bytes,
@@ -44,6 +44,7 @@ from optimizer import (
 
 # Initialize Flask application
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "cloud-storage-optimizer-secret-key-2026-production")
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 
 # Active drive manager and mode
@@ -285,34 +286,36 @@ HTML_TEMPLATE = """
                     </div>
 
                     <!-- Setup / Connect View -->
-                    <div id="google-connect-controls" class="space-y-2">
-                        <input type="file" id="cred-file-input" accept=".json" class="hidden" onchange="uploadCredentials(event)">
-                        <label for="cred-file-input" id="cred-file-label" class="block w-full text-center cursor-pointer py-1.5 bg-slate-700 hover:bg-slate-600 text-white font-semibold rounded-lg text-xs border border-slate-600 transition-all">
-                            <i class="fa-solid fa-upload mr-1.5 text-emerald-400"></i> Upload credentials.json
-                        </label>
-                        <button onclick="connectGoogleDrive()" id="btn-connect-live-drive" class="w-full py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg transition-all text-xs shadow-md flex items-center justify-center gap-1.5">
-                            <i class="fa-brands fa-google"></i> Connect Live Drive
-                        </button>
-
-                        <!-- Fast Token Connect (Zero Setup) -->
-                        <div class="pt-2 border-t border-slate-700/60">
-                            <button onclick="toggleTokenBox()" type="button" class="text-[11px] text-slate-400 hover:text-emerald-300 flex items-center justify-between w-full py-0.5 font-medium transition-all">
-                                <span><i class="fa-solid fa-key text-amber-400 mr-1"></i> Quick Token Connect (Zero Setup)</span>
-                                <i id="token-caret" class="fa-solid fa-chevron-down text-[10px]"></i>
-                            </button>
-                            <div id="google-token-box" class="hidden mt-2 space-y-1.5">
-                                <input type="password" id="google-token-input" placeholder="Paste access token (ya29...)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white outline-none focus:ring-1 focus:ring-emerald-500">
-                                <button onclick="connectGoogleToken()" class="w-full py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg transition-all text-xs shadow-sm">
-                                    Connect with Token
+                    <div id="google-connect-controls" class="space-y-2.5">
+                        <!-- 1. Quick Token Connect (Zero Setup) -->
+                        <div class="p-2.5 rounded-xl bg-emerald-950/30 border border-emerald-700/50 space-y-1.5">
+                            <div class="font-bold text-emerald-300 flex items-center gap-1.5 text-[11px]">
+                                <i class="fa-solid fa-bolt text-amber-400"></i> Fast Connect (No Cloud Setup):
+                            </div>
+                            <div class="text-[10px] text-slate-300 leading-tight">
+                                1. Open <a href="https://developers.google.com/oauthplayground" target="_blank" class="text-emerald-400 underline font-semibold">Google OAuth Playground</a><br>
+                                2. Select <b>Drive API v3</b> ➔ Authorize ➔ Copy token
+                            </div>
+                            <div class="flex gap-1.5 pt-0.5">
+                                <input type="password" id="google-token-input" placeholder="Paste token (ya29...)" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white outline-none focus:ring-1 focus:ring-emerald-500 font-mono">
+                                <button onclick="connectGoogleToken()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg transition-all text-xs shadow-md whitespace-nowrap">
+                                    Connect
                                 </button>
-                                <div class="text-[10px] text-slate-400 leading-tight">
-                                    Get free token in 10s: Open <a href="https://developers.google.com/oauthplayground" target="_blank" class="text-emerald-400 underline">OAuth Playground</a>, select Drive API v3, authorize & paste token.
-                                </div>
                             </div>
                         </div>
 
-                        <div class="p-2 rounded-lg bg-amber-950/40 border border-amber-800/50 text-[11px] text-amber-200/90 leading-tight">
-                            💡 <b>Google Cloud Setup:</b> Enable Google Drive API in Google Cloud Console. Create OAuth Client ID or Service Account and upload credentials.json.
+                        <!-- 2. Connect with credentials.json -->
+                        <div class="p-2.5 rounded-xl bg-slate-900/60 border border-slate-700/80 space-y-2">
+                            <div class="font-bold text-slate-200 text-[11px] flex items-center gap-1.5">
+                                <i class="fa-solid fa-file-shield text-blue-400"></i> Connect via credentials.json:
+                            </div>
+                            <input type="file" id="cred-file-input" accept=".json" class="hidden" onchange="uploadCredentials(event)">
+                            <label for="cred-file-input" id="cred-file-label" class="block w-full text-center cursor-pointer py-1.5 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-lg text-xs border border-slate-600 transition-all">
+                                <i class="fa-solid fa-upload mr-1.5 text-blue-400"></i> Upload credentials.json
+                            </label>
+                            <button onclick="connectGoogleDrive()" id="btn-connect-live-drive" class="w-full py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition-all text-xs shadow-md flex items-center justify-center gap-1.5">
+                                <i class="fa-brands fa-google"></i> Connect Live Drive
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -866,7 +869,8 @@ HTML_TEMPLATE = """
 
         async function fetchStats() {
             try {
-                const res = await fetch(`/api/stats?mode=${encodeURIComponent(currentActiveMode)}&path=${encodeURIComponent(currentActivePath)}`);
+                const token = localStorage.getItem('google_token') || '';
+                const res = await fetch(`/api/stats?mode=${encodeURIComponent(currentActiveMode)}&path=${encodeURIComponent(currentActivePath)}&token=${encodeURIComponent(token)}`);
                 currentData = await res.json();
                 renderUI();
             } catch (err) {
@@ -1572,11 +1576,14 @@ HTML_TEMPLATE = """
             try {
                 const res = await fetch('/api/upload-credentials', { method: 'POST', body: formData });
                 const data = await res.json();
+                if (data.success && data.client_config) {
+                    sessionStorage.setItem('google_client_config', JSON.stringify(data.client_config));
+                }
                 if (labelEl) {
                     labelEl.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-400 mr-1.5"></i> ${file.name} ready`;
                     labelEl.className = 'block w-full text-center cursor-pointer py-1.5 bg-emerald-950/60 text-emerald-200 font-semibold rounded-lg text-xs border border-emerald-700 transition-all';
                 }
-                alert(data.message || 'credentials.json uploaded successfully!');
+                alert(data.message || 'credentials.json uploaded successfully! Now click Connect Live Drive.');
                 if (data.service_account) {
                     currentActiveMode = 'google';
                     localStorage.setItem('storage_mode', 'google');
@@ -1584,7 +1591,7 @@ HTML_TEMPLATE = """
                 }
             } catch (err) {
                 alert('Upload error: ' + err);
-                if (labelEl) labelEl.innerHTML = '<i class="fa-solid fa-upload mr-1.5 text-emerald-400"></i> Upload credentials.json';
+                if (labelEl) labelEl.innerHTML = '<i class="fa-solid fa-upload mr-1.5 text-blue-400"></i> Upload credentials.json';
             }
         }
 
@@ -1592,11 +1599,17 @@ HTML_TEMPLATE = """
             const btn = document.getElementById('btn-connect-live-drive');
             if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Connecting...';
 
+            let clientCfg = null;
+            try {
+                const raw = sessionStorage.getItem('google_client_config');
+                if (raw) clientCfg = JSON.parse(raw);
+            } catch(e) {}
+
             try {
                 const res = await fetch('/api/set-mode', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({mode: 'google'})
+                    body: JSON.stringify({mode: 'google', client_config: clientCfg})
                 });
                 const data = await res.json();
 
@@ -1611,6 +1624,8 @@ HTML_TEMPLATE = """
                     localStorage.setItem('storage_mode', 'google');
                     alert('🎉 ' + data.message);
                     await fetchStats();
+                } else if (data.missing_credentials) {
+                    alert("To connect Google Drive:\n\n1. Use 'Fast Connect' above to paste a free token in 10s (easiest & instant!)\nOR\n2. Click 'Upload credentials.json' first, then click 'Connect Live Drive'.");
                 } else {
                     alert('⚠️ ' + data.message);
                 }
@@ -1649,6 +1664,7 @@ HTML_TEMPLATE = """
                 if (data.success) {
                     currentActiveMode = 'google';
                     localStorage.setItem('storage_mode', 'google');
+                    localStorage.setItem('google_token', token);
                     alert('🎉 ' + data.message);
                     if (tokenInput) tokenInput.value = '';
                     await fetchStats();
@@ -1663,6 +1679,8 @@ HTML_TEMPLATE = """
         async function disconnectGoogleDrive() {
             if (!confirm('Disconnect from Google Drive and return to Simulated Cloud?')) return;
             try {
+                localStorage.removeItem('google_token');
+                sessionStorage.removeItem('google_client_config');
                 await fetch('/api/disconnect-google', { method: 'POST' });
                 await changeMode('simulated');
                 alert('Disconnected from Google Drive.');
@@ -1865,6 +1883,7 @@ def api_stats():
     global drive_mgr, current_mode
     req_mode = request.args.get("mode")
     req_path = request.args.get("path")
+    token = request.args.get("token") or session.get("google_token") or (request.headers.get("Authorization") or "").replace("Bearer ", "").strip()
 
     if req_mode and req_mode != current_mode:
         if req_mode == "simulated":
@@ -1876,7 +1895,13 @@ def api_stats():
         elif req_mode == "google":
             current_mode = "google"
             drive_mgr = GoogleDriveManager()
-            drive_mgr.authenticate()
+            if token:
+                drive_mgr.authenticate_with_token(token)
+            else:
+                drive_mgr.authenticate()
+        invalidate_cache()
+    elif req_mode == "google" and token and not getattr(drive_mgr, "service", None):
+        drive_mgr.authenticate_with_token(token)
         invalidate_cache()
     elif req_mode == "local" and req_path and hasattr(drive_mgr, "raw_path") and drive_mgr.raw_path != req_path:
         drive_mgr = LocalFolderManager(req_path)
@@ -1934,15 +1959,28 @@ def api_set_mode():
     elif mode == "google":
         current_mode = "google"
         drive_mgr = GoogleDriveManager()
-        ok, msg = drive_mgr.authenticate()
 
+        # Check if access token was provided
+        token = data.get("token") or session.get("google_token")
+        if token:
+            ok, msg = drive_mgr.authenticate_with_token(token)
+            if ok:
+                session["google_token"] = token
+                return jsonify({"success": True, "mode": "google", "message": msg})
+
+        # Check existing on-disk token
+        ok, msg = drive_mgr.authenticate()
         if ok:
             return jsonify({"success": True, "mode": "google", "message": msg})
 
-        if msg == "OAUTH_FLOW_REQUIRED":
+        # Check client_config from request body or session
+        client_cfg = data.get("client_config") or session.get("google_client_config")
+        if client_cfg or msg == "OAUTH_FLOW_REQUIRED":
             try:
                 redirect_uri = url_for("oauth2callback", _external=True)
-                auth_url, state = drive_mgr.get_authorization_url(redirect_uri)
+                auth_url, state = drive_mgr.get_authorization_url(redirect_uri, client_config=client_cfg)
+                if client_cfg:
+                    session["google_client_config"] = client_cfg
                 return jsonify({
                     "success": False,
                     "requires_auth": True,
@@ -1952,10 +1990,14 @@ def api_set_mode():
             except Exception as e:
                 return jsonify({
                     "success": False,
-                    "message": f"Google Drive setup: {str(e)} Please upload credentials.json or use Quick Token Connect.",
+                    "message": f"Google Drive setup error: {str(e)}",
                 })
 
-        return jsonify({"success": False, "message": msg})
+        return jsonify({
+            "success": False,
+            "missing_credentials": True,
+            "message": "To connect Google Drive, please upload credentials.json or use Fast Connect above.",
+        })
 
     return jsonify({"success": False, "message": "Unknown mode"}), 400
 
@@ -1973,7 +2015,7 @@ def api_upload_credentials():
         with open(target_path, "wb") as f:
             f.write(content)
     except Exception as e:
-        return jsonify({"success": False, "message": f"Could not save credentials file: {e}"}), 500
+        print(f"Notice: Could not write credentials file to disk: {e}")
 
     invalidate_cache()
 
@@ -1984,23 +2026,28 @@ def api_upload_credentials():
             current_mode = "google"
             drive_mgr = GoogleDriveManager()
             ok, msg = drive_mgr.authenticate_with_service_account(target_path)
+            session["google_client_config"] = parsed
             return jsonify({
                 "success": ok,
                 "service_account": True,
+                "client_config": parsed,
                 "message": f"Service Account uploaded & authenticated: {msg}",
             })
         elif "web" in parsed or "installed" in parsed:
-            client_type = "Web Client" if "web" in parsed else "Desktop Client"
-            client_id = (parsed.get("web") or parsed.get("installed", {})).get("client_id", "")
+            norm_config = normalize_client_config(parsed)
+            session["google_client_config"] = norm_config
+            client_type = "Web Client" if "web" in norm_config else "Desktop Client"
+            client_id = (norm_config.get("web") or norm_config.get("installed", {})).get("client_id", "")
             masked_id = client_id[:12] + "..." if len(client_id) > 12 else client_id
             return jsonify({
                 "success": True,
                 "client_type": client_type,
                 "client_id": masked_id,
-                "message": f"credentials.json ({client_type}, ID: {masked_id}) uploaded successfully! Click 'Connect Live Drive'.",
+                "client_config": norm_config,
+                "message": f"credentials.json ({client_type}) uploaded successfully! Now click 'Connect Live Drive'.",
             })
-    except Exception:
-        pass
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Invalid credentials file format: {str(e)}"}), 400
 
     return jsonify({"success": True, "message": "Uploaded credentials.json successfully! Click 'Connect Live Drive' to authenticate."})
 
@@ -2009,6 +2056,7 @@ def api_upload_credentials():
 def oauth2callback():
     global drive_mgr, current_mode
     code = request.args.get("code")
+    state = request.args.get("state")
     error = request.args.get("error")
     if error:
         return f"<script>alert('Google Sign-In canceled: {error}'); window.location.href='/?mode=google';</script>"
@@ -2019,10 +2067,19 @@ def oauth2callback():
     current_mode = "google"
     drive_mgr = GoogleDriveManager()
     redirect_uri = url_for("oauth2callback", _external=True)
-    ok, msg = drive_mgr.exchange_code(code, redirect_uri)
+    client_cfg = session.get("google_client_config")
+    ok, msg = drive_mgr.exchange_code(code, redirect_uri, client_config=client_cfg, state=state)
     invalidate_cache()
 
     if ok:
+        token = ""
+        try:
+            token = getattr(drive_mgr.service, "_credentials", None) and getattr(drive_mgr.service._credentials, "token", "")
+            if token:
+                session["google_token"] = token
+        except Exception:
+            pass
+
         return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2035,13 +2092,14 @@ def oauth2callback():
         <div class="w-16 h-16 bg-emerald-950/80 border border-emerald-700/80 text-emerald-400 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl font-bold">✓</div>
         <h2 class="text-xl font-bold text-white mb-2">Google Drive Connected!</h2>
         <p class="text-xs text-slate-400 mb-6">{msg}</p>
-        <a href="/?mode=google&google_connected=1" class="inline-block w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs transition-all shadow-md">
+        <a href="/?mode=google&google_connected=1{f'&token={token}' if token else ''}" class="inline-block w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs transition-all shadow-md">
             Return to Dashboard
         </a>
     </div>
     <script>
+        {f'localStorage.setItem("google_token", "{token}");' if token else ''}
         setTimeout(function() {{
-            window.location.href = '/?mode=google&google_connected=1';
+            window.location.href = '/?mode=google&google_connected=1{f"&token={token}" if token else ""}';
         }}, 1200);
     </script>
 </body>
